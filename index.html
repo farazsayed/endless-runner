@@ -1,0 +1,825 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <!-- Mobile viewport: prevent user scaling, fill full screen -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Endless Runner</title>
+  <!-- Inter: clean, modern, sharp — loaded before Phaser boots -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=block" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #ffffff;
+      overflow: hidden;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      width: 100vw;
+      height: 100vh;
+    }
+
+    /* Phaser injects a <canvas> here; FIT scale mode handles sizing */
+    #game-container {
+      width: 100%;
+      height: 100%;
+    }
+
+    /* Smooth CSS scaling — prevents nearest-neighbor pixelation when
+       the canvas is stretched to fill the screen */
+    canvas {
+      image-rendering: auto;
+    }
+  </style>
+</head>
+<body>
+<div id="game-container"></div>
+
+<!-- Phaser 3 via CDN — no build step required -->
+<script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+
+<script>
+'use strict';
+
+// ============================================================
+// AUDIO ENGINE
+// Generates all sounds with the Web Audio API — no audio files needed.
+// ============================================================
+const AudioEngine = (() => {
+  let ctx = null;
+
+  // Lazily create/resume the AudioContext (browsers block it until a user gesture)
+  function getCtx() {
+    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (ctx.state === 'suspended') ctx.resume();
+    return ctx;
+  }
+
+  // Generic tone builder: oscillator + gain envelope
+  function playTone({ freq = 440, endFreq = freq, type = 'square', duration = 0.15, volume = 0.3 }) {
+    try {
+      const c    = getCtx();
+      const osc  = c.createOscillator();
+      const gain = c.createGain();
+      osc.connect(gain);
+      gain.connect(c.destination);
+
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, c.currentTime);
+      if (endFreq !== freq) {
+        osc.frequency.exponentialRampToValueAtTime(endFreq, c.currentTime + duration);
+      }
+      gain.gain.setValueAtTime(volume, c.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, c.currentTime + duration);
+
+      osc.start(c.currentTime);
+      osc.stop(c.currentTime + duration + 0.02);
+    } catch (e) { /* silently ignore — e.g. autoplay policy */ }
+  }
+
+  return {
+    // Short rising blip on jump
+    jump:      () => playTone({ freq: 320, endFreq: 680, type: 'square',   duration: 0.11, volume: 0.18 }),
+    // Descending tone on death
+    die:       () => playTone({ freq: 520, endFreq: 130, type: 'sawtooth', duration: 0.55, volume: 0.28 }),
+    // Quick chime on speed milestone
+    milestone: () => playTone({ freq: 580, endFreq: 920, type: 'sine',     duration: 0.22, volume: 0.22 }),
+  };
+})();
+
+// ============================================================
+// CONSTANTS
+// All magic numbers live here — easy to tweak.
+// ============================================================
+const C = {
+  // Logical canvas size (Phaser scales this to fit the real screen)
+  W: 800,
+  H: 300,
+
+  // Y position of the ground line (pixels from top)
+  GROUND_Y: 255,
+
+  // Player
+  PLAYER_X:   120,   // fixed horizontal position
+  PLAYER_SIZE: 80,   // sprite display size (square) — larger = crisper on HiDPI screens
+
+  // Physics (manual — no Phaser arcade physics used)
+  GRAVITY:   2200,   // px / s²
+  JUMP_VY:   -760,   // upward velocity applied on jump (negative = up on screen)
+  COYOTE_MS:   80,   // ms of grace time after walking off a ledge
+
+  // Scroll speed
+  BASE_SPEED:  280,  // starting scroll speed in px/s
+  MAX_SPEED:   900,  // hard cap so game doesn't become unplayable
+  SPEED_INC:    30,  // px/s added per milestone
+  MILESTONE:   500,  // score points between milestones
+
+  // Obstacles
+  OBS_SHORT: { w: 40, h: 50 },   // must jump over
+  OBS_TALL:  { w: 40, h: 90 },   // must jump over (higher)
+  OBS_FLY:   { w: 65, h: 35 },   // must duck under (or jump over)
+
+  // Obstacle spawn gaps (ms). Shrinks as speed grows.
+  SPAWN_GAP_MIN: 850,
+  SPAWN_GAP_MAX: 2300,
+
+  // Despawn distance off the left edge
+  OBS_MARGIN: 90,
+
+  // Ducking — reduces hitbox height to this fraction
+  DUCK_RATIO: 0.5,
+
+  // Scoring
+  SCORE_INTERVAL: 100,  // ms between score ticks
+  SCORE_PER_TICK:    5, // points per tick
+};
+
+// Color palette (dark on white)
+const NEON = {
+  ground:    0x222222,   // dark ground line
+  obstacle:  0x222222,   // obstacle outline
+  obsGlow:   0x666666,   // inner glow ring
+  ui:       '#222222',   // primary UI text
+  uiDim:    '#aaaaaa',   // secondary/dim UI text
+};
+
+// ============================================================
+// UTILITY — Axis-Aligned Bounding Box collision
+// All arguments are top-left origin, width, height.
+// Returns true if the two rectangles overlap.
+// ============================================================
+function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh) {
+  return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+}
+
+// ============================================================
+// SCENE: PRELOAD
+// Attempts to load /assets/player.png.
+// Generates a colorful placeholder if the file is missing or broken.
+// ============================================================
+class PreloadScene extends Phaser.Scene {
+  constructor() { super('Preload'); }
+
+  preload() {
+    // Register error handler BEFORE loading
+    this.load.on('loaderror', (file) => {
+      if (file.key === 'player') {
+        console.warn('[Runner] assets/player.png not found — generating placeholder sprite.');
+        this.playerLoadFailed = true;
+      }
+    });
+
+    // Cache-bust with timestamp so replacing assets/player.png is always picked up
+    this.load.image('player', 'assets/player.png?v=' + Date.now());
+  }
+
+  // Creates a green "face" texture and stores it as 'player'
+  createFallbackTexture() {
+    const size = C.PLAYER_SIZE;
+    const g    = this.make.graphics({ x: 0, y: 0, add: false });
+
+    // Rounded square body
+    g.fillStyle(0x00cc66, 1);
+    g.fillRoundedRect(2, 2, size - 4, size - 4, 10);
+
+    // Eyes
+    g.fillStyle(0x0a0a0a, 1);
+    g.fillCircle(20, 22, 7);
+    g.fillCircle(44, 22, 7);
+
+    // Eye shine
+    g.fillStyle(0xffffff, 1);
+    g.fillCircle(22, 20, 2.5);
+    g.fillCircle(46, 20, 2.5);
+
+    // Smile arc
+    g.lineStyle(3, 0x0a0a0a, 1);
+    g.beginPath();
+    g.arc(32, 35, 13, 0.3, Math.PI - 0.3, false);
+    g.strokePath();
+
+    g.generateTexture('player', size, size);
+    g.destroy();
+  }
+
+  create() {
+    // Use fallback if load failed, or if the server returned a 1×1 error image
+    const needsFallback =
+      this.playerLoadFailed ||
+      !this.textures.exists('player') ||
+      this.textures.get('player').source[0].width <= 1;
+
+    if (needsFallback) {
+      if (this.textures.exists('player')) this.textures.remove('player');
+      this.createFallbackTexture();
+    }
+
+    this.scene.start('Start');
+  }
+}
+
+// ============================================================
+// SCENE: START SCREEN
+// Shows a bouncing player sprite and waits for input.
+// ============================================================
+class StartScene extends Phaser.Scene {
+  constructor() { super('Start'); }
+
+  create() {
+    const { W, H, GROUND_Y, PLAYER_X, PLAYER_SIZE } = C;
+
+    // ---- Background ----
+    this.add.rectangle(W / 2, H / 2, W, H, 0xffffff);
+
+    // Ground line
+    const gfx = this.add.graphics();
+    gfx.lineStyle(2, NEON.ground, 1);
+    gfx.lineBetween(0, GROUND_Y, W, GROUND_Y);
+
+    // Bouncing player sprite
+    const player = this.add.image(PLAYER_X, GROUND_Y - PLAYER_SIZE / 2, 'player');
+    player.setDisplaySize(PLAYER_SIZE, PLAYER_SIZE);
+
+    // Title
+    this.add.text(W / 2, H * 0.25, 'ENDLESS RUNNER', {
+      fontFamily: '"Inter", system-ui, sans-serif',
+      fontSize:   '30px',
+      color:      '#111111',
+    }).setOrigin(0.5);
+
+    // Blinking start prompt
+    const prompt = this.add.text(W / 2, H * 0.60, 'PRESS SPACE  /  TAP TO START', {
+      fontFamily: '"Inter", system-ui, sans-serif',
+      fontSize:   '14px',
+      color:      '#444444',
+    }).setOrigin(0.5);
+    this.tweens.add({ targets: prompt, alpha: 0, duration: 580, yoyo: true, repeat: -1 });
+
+    // Controls hint
+    this.add.text(W / 2, H * 0.76, '↑ SPACE = JUMP    ↓ S = DUCK    (mobile: tap / swipe down)', {
+      fontFamily: '"Inter", system-ui, sans-serif',
+      fontSize:   '10px',
+      color:      '#aaaaaa',
+    }).setOrigin(0.5);
+
+    // High score
+    const hs = parseInt(localStorage.getItem('endlessRunnerHS') || '0');
+    if (hs > 0) {
+      this.add.text(W / 2, H * 0.91, `BEST SCORE: ${hs}`, {
+        fontFamily: '"Inter", system-ui, sans-serif',
+        fontSize:   '11px',
+        color:      '#888888',
+      }).setOrigin(0.5);
+    }
+
+    // ---- Input ----
+    const start = () => this.scene.start('Game');
+    this.input.keyboard.on('keydown-SPACE', start);
+    this.input.keyboard.on('keydown-UP',    start);
+    this.input.keyboard.on('keydown-W',     start);
+    this.input.on('pointerdown',            start);
+  }
+
+}
+
+// ============================================================
+// SCENE: GAME
+// The core game loop: physics, obstacles, scoring, rendering.
+// ============================================================
+class GameScene extends Phaser.Scene {
+  constructor() { super('Game'); }
+
+  // ----------------------------------------------------------
+  // CREATE — runs once when the scene starts
+  // ----------------------------------------------------------
+  create() {
+    const { W, H, GROUND_Y, PLAYER_X, PLAYER_SIZE, BASE_SPEED } = C;
+
+    // ==== GAME STATE ====
+    this.scrollSpeed   = BASE_SPEED;
+    this.score         = 0;
+    this.highScore     = parseInt(localStorage.getItem('endlessRunnerHS') || '0');
+    this.gameRunning   = true;
+    this.nextMilestone = C.MILESTONE;
+    this.scoreTimer    = 0;    // accumulates ms for score ticks
+    this.flashTimer    = 0;    // ms remaining for milestone flash
+
+    // ==== PLAYER PHYSICS STATE ====
+    // playerY is the sprite's CENTER Y position
+    this.playerY    = GROUND_Y - PLAYER_SIZE / 2;
+    this.playerVY   = 0;       // vertical velocity (positive = falling)
+    this.onGround   = true;
+    this.coyoteTimer = 0;      // ms of coyote grace remaining
+    this.hasJumped   = false;  // prevents double-jump
+    this.isDucking   = false;
+
+    // Hitbox dimensions (with a small inset for fairness)
+    this.hitW = PLAYER_SIZE * 0.76;
+    this.hitH = PLAYER_SIZE * 0.76;
+
+    // ==== OBSTACLE LIST ====
+    // Each obstacle: { type, x, y, w, h }
+    // x and y are the CENTER of the obstacle rectangle
+    this.obstacles       = [];
+    this.spawnTimer      = 0;
+    this.nextSpawnDelay  = this.calcSpawnDelay();
+
+
+    // ==== TOUCH STATE ====
+    this.touchStartY    = 0;
+    this.touchStartTime = 0;
+
+    // ---- BUILD SCENE LAYERS (back → front) ----
+
+    // 1. Solid background fill
+    this.add.rectangle(W / 2, H / 2, W, H, 0xffffff);
+
+    // 2. Ground graphics
+    this.groundGfx = this.add.graphics();
+
+    // 4. Obstacle graphics
+    this.obsGfx = this.add.graphics();
+
+    // 5. Player sprite
+    this.playerSprite = this.add.image(PLAYER_X, this.playerY, 'player');
+    this.playerSprite.setDisplaySize(PLAYER_SIZE, PLAYER_SIZE);
+
+    // 6. HUD text (score / high score)
+    this.scoreTxt = this.add.text(W - 12, 10, `SCORE\n0`, {
+      fontFamily: '"Inter", system-ui, sans-serif',
+      fontSize:   '14px',
+      color:      NEON.ui,
+      align:      'right',
+    }).setOrigin(1, 0);
+
+    this.hsTxt = this.add.text(W - 12, 52, `BEST\n${this.highScore}`, {
+      fontFamily: '"Inter", system-ui, sans-serif',
+      fontSize:   '11px',
+      color:      NEON.uiDim,
+      align:      'right',
+    }).setOrigin(1, 0);
+
+    // Speed indicator (small, bottom-right)
+    this.speedTxt = this.add.text(W - 12, H - 12, '', {
+      fontFamily: '"Inter", system-ui, sans-serif',
+      fontSize:   '9px',
+      color:      '#cccccc',
+      align:      'right',
+    }).setOrigin(1, 1);
+
+    // 7. Milestone flash overlay (transparent until milestone)
+    this.flashRect = this.add.rectangle(W / 2, H / 2, W, H, 0x000000, 0);
+
+    // ---- INPUT SETUP ----
+    this.setupInput();
+  }
+
+  setupInput() {
+    const kb = this.input.keyboard;
+
+    // Jump keys
+    kb.on('keydown-UP',    () => this.tryJump());
+    kb.on('keydown-SPACE', () => this.tryJump());
+    kb.on('keydown-W',     () => this.tryJump());
+
+    // Duck keys (held)
+    kb.on('keydown-DOWN', () => this.startDuck());
+    kb.on('keydown-S',    () => this.startDuck());
+    kb.on('keyup-DOWN',   () => this.stopDuck());
+    kb.on('keyup-S',      () => this.stopDuck());
+
+    // Touch: tap = jump, swipe down = duck
+    this.input.on('pointerdown', (p) => {
+      this.touchStartY    = p.y;
+      this.touchStartTime = Date.now();
+      this.tryJump();
+    });
+    this.input.on('pointerup', (p) => {
+      const dy = p.y - this.touchStartY;
+      const dt = Date.now() - this.touchStartTime;
+      // Swipe-down gesture: downward movement > 45px within 320ms
+      if (dy > 45 && dt < 320) {
+        this.startDuck();
+        // Auto-release duck after a short hold
+        this.time.delayedCall(420, () => this.stopDuck());
+      }
+    });
+  }
+
+  // ----------------------------------------------------------
+  // JUMP
+  // ----------------------------------------------------------
+  tryJump() {
+    if (!this.gameRunning) return;
+    if (this.isDucking) this.stopDuck(); // un-duck before jumping
+
+    const canJump = this.onGround || this.coyoteTimer > 0;
+    if (canJump && !this.hasJumped) {
+      this.playerVY   = C.JUMP_VY;
+      this.onGround   = false;
+      this.coyoteTimer = 0;
+      this.hasJumped  = true;
+      AudioEngine.jump();
+    }
+  }
+
+  // ----------------------------------------------------------
+  // DUCK
+  // ----------------------------------------------------------
+  startDuck() {
+    if (!this.gameRunning || this.isDucking) return;
+    this.isDucking = true;
+    // Shrink the sprite display size (keep bottom edge at ground)
+    this.playerSprite.setDisplaySize(C.PLAYER_SIZE, C.PLAYER_SIZE * C.DUCK_RATIO);
+    this.hitH = C.PLAYER_SIZE * 0.76 * C.DUCK_RATIO;
+  }
+
+  stopDuck() {
+    if (!this.isDucking) return;
+    this.isDucking = false;
+    this.playerSprite.setDisplaySize(C.PLAYER_SIZE, C.PLAYER_SIZE);
+    this.hitH = C.PLAYER_SIZE * 0.76;
+  }
+
+  // ----------------------------------------------------------
+  // OBSTACLE SPAWN TIMING
+  // The gap shrinks as speed increases, keeping the challenge fair.
+  // ----------------------------------------------------------
+  calcSpawnDelay() {
+    const speedRatio = Math.max(0, 1 - (this.scrollSpeed - C.BASE_SPEED) / 650);
+    const lo = C.SPAWN_GAP_MIN * (0.55 + speedRatio * 0.45);
+    const hi = C.SPAWN_GAP_MAX * (0.55 + speedRatio * 0.45);
+    return Phaser.Math.Between(lo, hi);
+  }
+
+  spawnObstacle() {
+    const { W, GROUND_Y } = C;
+    // Pick one of three obstacle types at random
+    const types = ['short', 'tall', 'fly'];
+    const type  = types[Math.floor(Math.random() * types.length)];
+
+    let w, h, y;
+    if (type === 'short') {
+      ({ w, h } = C.OBS_SHORT);
+      y = GROUND_Y - h / 2;           // bottom flush with ground
+    } else if (type === 'tall') {
+      ({ w, h } = C.OBS_TALL);
+      y = GROUND_Y - h / 2;
+    } else {
+      // Flying obstacle — positioned so:
+      //   - standing player (top at ~191) COLLIDES with it
+      //   - ducking player  (top at ~223) passes UNDER it
+      ({ w, h } = C.OBS_FLY);
+      y = GROUND_Y - 62;              // center Y (~193); bottom at ~210
+    }
+
+    // Spawn just off the right edge
+    this.obstacles.push({ type, x: W + w, y, w, h });
+  }
+
+  // ----------------------------------------------------------
+  // MAIN UPDATE LOOP — called every frame by Phaser
+  // ----------------------------------------------------------
+  update(time, delta) {
+    if (!this.gameRunning) return;
+
+    const dt = delta / 1000; // milliseconds → seconds for physics
+
+    this.updatePlayer(dt, delta);
+    this.updateObstacles(dt);
+    this.updateScore(delta);
+    this.updateSpawner(delta);
+
+    this.checkCollisions();
+
+    // --- Redraw graphics each frame ---
+    this.drawGround();
+    this.drawObstacles();
+    this.updatePlayerSprite();
+
+    // Fade out flash overlay
+    if (this.flashTimer > 0) {
+      this.flashTimer -= delta;
+      this.flashRect.setAlpha(Math.max(0, (this.flashTimer / 350) * 0.18));
+    }
+  }
+
+  // ----------------------------------------------------------
+  // PLAYER PHYSICS — manual gravity + ground collision
+  // ----------------------------------------------------------
+  updatePlayer(dt, delta) {
+    const { GROUND_Y, PLAYER_SIZE, DUCK_RATIO, GRAVITY, COYOTE_MS } = C;
+
+    // Apply gravity (accelerates player downward each frame)
+    this.playerVY += GRAVITY * dt;
+
+    // Move player
+    this.playerY += this.playerVY * dt;
+
+    // Ground Y for the player's CENTER depends on whether ducking
+    const halfH       = (this.isDucking ? PLAYER_SIZE * DUCK_RATIO : PLAYER_SIZE) / 2;
+    const groundCenterY = GROUND_Y - halfH;
+
+    if (this.playerY >= groundCenterY) {
+      // Hit the ground
+      const wasInAir = !this.onGround;
+      this.playerY  = groundCenterY;
+      this.playerVY = 0;
+      this.onGround = true;
+      this.coyoteTimer = 0;
+      if (wasInAir) this.hasJumped = false; // allow jumping again after landing
+    } else {
+      // In the air
+      if (this.onGround) {
+        // Just left the ground — start coyote timer
+        this.coyoteTimer = COYOTE_MS;
+      }
+      this.onGround = false;
+      if (this.coyoteTimer > 0) {
+        this.coyoteTimer = Math.max(0, this.coyoteTimer - delta);
+      }
+    }
+  }
+
+  // ----------------------------------------------------------
+  // OBSTACLE MOVEMENT
+  // ----------------------------------------------------------
+  updateObstacles(dt) {
+    for (let i = this.obstacles.length - 1; i >= 0; i--) {
+      this.obstacles[i].x -= this.scrollSpeed * dt;
+      // Remove when fully off the left edge
+      if (this.obstacles[i].x + this.obstacles[i].w / 2 < -C.OBS_MARGIN) {
+        this.obstacles.splice(i, 1);
+      }
+    }
+  }
+
+  // ----------------------------------------------------------
+  // OBSTACLE SPAWNER
+  // ----------------------------------------------------------
+  updateSpawner(delta) {
+    this.spawnTimer += delta;
+    if (this.spawnTimer >= this.nextSpawnDelay) {
+      this.spawnObstacle();
+      this.spawnTimer     = 0;
+      this.nextSpawnDelay = this.calcSpawnDelay();
+    }
+  }
+
+  // ----------------------------------------------------------
+  // COLLISION DETECTION — AABB with a small fairness inset
+  // ----------------------------------------------------------
+  checkCollisions() {
+    const { PLAYER_X, PLAYER_SIZE, DUCK_RATIO } = C;
+
+    // Determine player hitbox (uses live playerY position, not ground)
+    const duckH  = this.isDucking ? PLAYER_SIZE * DUCK_RATIO : PLAYER_SIZE;
+    const margin = 5;                          // fairness inset (pixels)
+    const px = PLAYER_X - this.hitW / 2 + margin;
+    const py = this.playerY - duckH / 2 + margin;  // top of hitbox
+    const pw = this.hitW - margin * 2;
+    const ph = duckH - margin * 2;
+
+    for (const obs of this.obstacles) {
+      const ox = obs.x - obs.w / 2;
+      const oy = obs.y - obs.h / 2;
+      if (rectsOverlap(px, py, pw, ph, ox, oy, obs.w, obs.h)) {
+        this.triggerGameOver();
+        return;
+      }
+    }
+  }
+
+  // ----------------------------------------------------------
+  // SCORING & SPEED MILESTONES
+  // ----------------------------------------------------------
+  updateScore(delta) {
+    this.scoreTimer += delta;
+    if (this.scoreTimer >= C.SCORE_INTERVAL) {
+      this.scoreTimer -= C.SCORE_INTERVAL;
+      this.score      += C.SCORE_PER_TICK;
+      this.scoreTxt.setText(`SCORE\n${this.score}`);
+      this.speedTxt.setText(`spd ${Math.round(this.scrollSpeed)}`);
+
+      // Milestone reached → increase speed + flash
+      if (this.score >= this.nextMilestone) {
+        this.nextMilestone += C.MILESTONE;
+        this.scrollSpeed    = Math.min(C.MAX_SPEED, this.scrollSpeed + C.SPEED_INC);
+        this.flashTimer     = 380;
+        this.flashRect.setAlpha(0.18);
+        AudioEngine.milestone();
+      }
+
+      // Update high score live
+      if (this.score > this.highScore) {
+        this.highScore = this.score;
+        localStorage.setItem('endlessRunnerHS', this.highScore);
+        this.hsTxt.setText(`BEST\n${this.highScore}`).setColor(NEON.ui);
+      }
+    }
+  }
+
+  // ----------------------------------------------------------
+  // PLAYER SPRITE POSITION & ANIMATION
+  // ----------------------------------------------------------
+  updatePlayerSprite() {
+    const { PLAYER_X } = C;
+    this.playerSprite.setPosition(PLAYER_X, this.playerY);
+    this.playerSprite.setRotation(0);
+  }
+
+  // ----------------------------------------------------------
+  // DRAW — GROUND LINE
+  // ----------------------------------------------------------
+  drawGround() {
+    const { W, GROUND_Y } = C;
+    this.groundGfx.clear();
+    this.groundGfx.lineStyle(2, NEON.ground, 1);
+    this.groundGfx.lineBetween(0, GROUND_Y, W, GROUND_Y);
+  }
+
+  // ----------------------------------------------------------
+  // DRAW — OBSTACLES
+  // Neon-outlined rectangles; flying ones get small wing marks.
+  // ----------------------------------------------------------
+  drawObstacles() {
+    const g = this.obsGfx;
+    g.clear();
+
+    for (const obs of this.obstacles) {
+      const left = obs.x - obs.w / 2;
+      const top  = obs.y - obs.h / 2;
+
+      // Dark fill against white background
+      g.fillStyle(0x333333, 1);
+      g.fillRect(left, top, obs.w, obs.h);
+
+      // Outer neon outline
+      g.lineStyle(2, NEON.obstacle, 1);
+      g.strokeRect(left, top, obs.w, obs.h);
+
+      // Inner glow ring
+      g.lineStyle(1, NEON.obsGlow, 0.45);
+      g.strokeRect(left + 3, top + 3, obs.w - 6, obs.h - 6);
+
+      // Flying obstacle — small wing chevrons
+      if (obs.type === 'fly') {
+        const mx = obs.x;
+        const my = obs.y;
+        const wl = left - 10;
+        const wr = left + obs.w + 10;
+        g.lineStyle(1.5, NEON.obstacle, 0.7);
+        // Left wing
+        g.lineBetween(wl, my,     left, my - 9);
+        g.lineBetween(wl, my,     left, my + 9);
+        // Right wing
+        g.lineBetween(wr, my, left + obs.w, my - 9);
+        g.lineBetween(wr, my, left + obs.w, my + 9);
+      }
+    }
+  }
+
+  // ----------------------------------------------------------
+  // GAME OVER — triggered on collision
+  // ----------------------------------------------------------
+  triggerGameOver() {
+    if (!this.gameRunning) return;
+    this.gameRunning = false;
+
+    // Persist high score
+    if (this.score > parseInt(localStorage.getItem('endlessRunnerHS') || '0')) {
+      localStorage.setItem('endlessRunnerHS', this.score);
+    }
+
+    AudioEngine.die();
+
+    // Camera shake + red tint on player
+    this.cameras.main.shake(320, 0.018);
+    this.playerSprite.setTint(0xff2222);
+
+    // Short delay before showing the Game Over screen
+    this.time.delayedCall(650, () => {
+      this.scene.start('GameOver', {
+        score:     this.score,
+        highScore: Math.max(this.score, this.highScore),
+      });
+    });
+  }
+}
+
+// ============================================================
+// SCENE: GAME OVER
+// Displays final score, high score, and restart prompt.
+// ============================================================
+class GameOverScene extends Phaser.Scene {
+  constructor() { super('GameOver'); }
+
+  init(data) {
+    this.finalScore = data.score     || 0;
+    this.highScore  = data.highScore || 0;
+  }
+
+  create() {
+    const { W, H, GROUND_Y, PLAYER_X, PLAYER_SIZE } = C;
+
+    // Background
+    this.add.rectangle(W / 2, H / 2, W, H, 0xffffff);
+
+    // Decorative ground
+    const gfx = this.add.graphics();
+    gfx.lineStyle(2, NEON.ground, 1);
+    gfx.lineBetween(0, GROUND_Y, W, GROUND_Y);
+
+    // Dead player sprite (red tint, slightly tilted)
+    const player = this.add.image(PLAYER_X, GROUND_Y - PLAYER_SIZE / 2, 'player');
+    player.setDisplaySize(PLAYER_SIZE, PLAYER_SIZE);
+    player.setTint(0xff3333);
+    player.setRotation(0.25);
+
+    // 😵 emoji overlaid on the player
+    this.add.text(PLAYER_X, GROUND_Y - PLAYER_SIZE / 2, '😵', {
+      fontSize: '34px',
+    }).setOrigin(0.5);
+
+    // GAME OVER title
+    this.add.text(W / 2, H * 0.20, 'GAME OVER', {
+      fontFamily: '"Inter", system-ui, sans-serif',
+      fontSize:   '34px',
+      color:      '#cc2222',
+    }).setOrigin(0.5);
+
+    // Final score
+    this.add.text(W / 2, H * 0.46, `SCORE: ${this.finalScore}`, {
+      fontFamily: '"Inter", system-ui, sans-serif',
+      fontSize:   '22px',
+      color:      '#111111',
+    }).setOrigin(0.5);
+
+    // High score (highlighted if new record)
+    const isNew    = this.finalScore >= this.highScore && this.finalScore > 0;
+    const hsTxt    = isNew ? `★ NEW BEST: ${this.highScore} ★` : `BEST: ${this.highScore}`;
+    const hsColor  = isNew ? '#bb8800' : '#888888';
+    this.add.text(W / 2, H * 0.63, hsTxt, {
+      fontFamily: '"Inter", system-ui, sans-serif',
+      fontSize:   '14px',
+      color:      hsColor,
+    }).setOrigin(0.5);
+
+    // Blinking restart prompt
+    const prompt = this.add.text(W / 2, H * 0.84, 'PRESS SPACE  /  TAP TO RESTART', {
+      fontFamily: '"Inter", system-ui, sans-serif',
+      fontSize:   '13px',
+      color:      '#444444',
+    }).setOrigin(0.5);
+    this.tweens.add({ targets: prompt, alpha: 0, duration: 560, yoyo: true, repeat: -1 });
+
+    // Ignore input for a short window to prevent instant accidental restart
+    this.time.delayedCall(720, () => {
+      const restart = () => this.scene.start('Game');
+      this.input.keyboard.on('keydown-SPACE', restart);
+      this.input.keyboard.on('keydown-UP',    restart);
+      this.input.keyboard.on('keydown-W',     restart);
+      this.input.on('pointerdown',             restart);
+    });
+  }
+}
+
+// ============================================================
+// PHASER GAME CONFIGURATION
+// ============================================================
+const phaserConfig = {
+  type: Phaser.AUTO,          // WebGL → Canvas fallback
+  parent: 'game-container',
+  backgroundColor: '#ffffff',
+
+  // Smooth rendering — no pixel-art nearest-neighbour sampling
+  render: {
+    antialias:   true,
+    antialiasGL: true,
+    pixelArt:    false,
+  },
+
+  // Responsive scaling: the logical 800×300 canvas fits any screen size
+  scale: {
+    mode:       Phaser.Scale.FIT,
+    autoCenter: Phaser.Scale.CENTER_BOTH,
+    width:      C.W,
+    height:     C.H,
+  },
+
+  // We handle physics manually — no built-in physics needed
+  physics: { default: 'arcade', arcade: { debug: false } },
+
+  // Scenes run in order: Preload → Start → Game → GameOver
+  scene: [PreloadScene, StartScene, GameScene, GameOverScene],
+};
+
+// Wait for Inter to finish loading before Phaser creates any text objects,
+// so the font is guaranteed to be available on first render.
+document.fonts.ready.then(() => new Phaser.Game(phaserConfig));
+</script>
+</body>
+</html>
